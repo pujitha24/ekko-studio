@@ -53,6 +53,17 @@ describe('global native usage accounting', () => {
       stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
       exitCode: null, signalCode: null, kill: vi.fn(),
     })
+    child.stdin.on('data', (chunk: Buffer) => {
+      for (const line of chunk.toString().trim().split('\n')) {
+        let request: any
+        try { request = JSON.parse(line) } catch { continue }
+        const result = request.method === 'initialize' ? {}
+          : request.method === 'thread/start' || request.method === 'thread/resume'
+            ? { thread: { id: request.params.threadId || 'native-thread' } }
+            : request.method === 'turn/start' ? { turn: { id: 'native-turn' } } : undefined
+        if (result) emit({ id: request.id, result })
+      }
+    })
     vi.mocked(spawn).mockReturnValue(child)
   }
   afterEach(async () => {
@@ -72,8 +83,25 @@ describe('global native usage accounting', () => {
       workspaceDir: workspace, env: { GROK_HOME: workspace, CODEX_HOME: workspace, OPENCODE_DB: join(workspace, 'opencode.db') },
     })
     manager.send(sessionId, 'usage audit')
+    if (agentId === 'codex') return flushCodexHandshake()
+  }
+  async function flushCodexHandshake() {
+    for (let index = 0; index < 10; index++) await Promise.resolve()
   }
   function emit(event: unknown) { child.stdout.write(`${JSON.stringify(event)}\n`) }
+  function codex(method: string, params: Record<string, unknown> = {}) {
+    emit({ method, params: { threadId: 'native-thread', turnId: 'native-turn', ...params } })
+  }
+  function codexUsage(usage: { input_tokens: number; output_tokens: number; cached_input_tokens?: number }) {
+    codex('thread/tokenUsage/updated', { tokenUsage: { last: {
+      inputTokens: usage.input_tokens, cachedInputTokens: usage.cached_input_tokens || 0,
+      outputTokens: usage.output_tokens,
+    } } })
+  }
+  function codexComplete(usage: { input_tokens: number; output_tokens: number; cached_input_tokens?: number }) {
+    codexUsage(usage)
+    codex('turn/completed', { turn: { id: 'native-turn', status: 'completed' } })
+  }
   function close(code = 0) {
     child.exitCode = code
     child.emit('exit', code)
@@ -129,7 +157,7 @@ describe('global native usage accounting', () => {
   }
 
   it.each(['codex', 'claude-code', 'pi', 'grok', 'cursor', 'opencode'])('persists a stopped %s card through the actual socket abort path', async agent => {
-    start(agent, 'scoped')
+    await start(agent, 'scoped')
     const state = (manager as any).getBySession(sessionId).state
     manager.handleProxyUsageEvent(sessionId, { type: 'response.completed', data: { response: {
       id: 'request-before-stop', usage: { input_tokens: 20, output_tokens: 4, input_tokens_details: { cached_tokens: 5 } },
@@ -149,9 +177,8 @@ describe('global native usage accounting', () => {
     const updates: any[] = []
     const unsubscribe = onRunUsageUpdated((sid, summary) => { if (sid === sessionId) updates.push(summary) })
     try {
-      start('codex')
-      emit({ type: 'thread.started', thread_id: 'native-thread' })
-      if (action !== 'stop-before-text') emit({ type: 'item.completed', item: { id: 'partial', type: 'agent_message', text: 'partial answer' } })
+      await start('codex')
+      if (action !== 'stop-before-text') codex('item/completed', { item: { id: 'partial', type: 'agentMessage', text: 'partial answer' } })
       let terminal: any
       const interrupted = action === 'queue' ? manager.interruptForQueueInsertion(sessionId) : undefined
       if (!interrupted) terminal = await abortThroughSocket()
@@ -175,16 +202,20 @@ describe('global native usage accounting', () => {
   })
 
   it.each(['codex', 'claude-code', 'grok', 'cursor'])('settles %s output once even when native accounting throws', async agent => {
-    start(agent)
+    await start(agent)
     vi.spyOn(NativeTurnUsage.prototype, 'rows').mockImplementation(() => { throw new Error('bad native usage') })
     const usage = { input_tokens: 10, output_tokens: 2 }
     const events: Record<string, unknown[]> = {
-      codex: [{ type: 'item.completed', item: { id: 'a', type: 'agent_message', text: 'done' } }, { type: 'turn.completed', usage }],
+      codex: [],
       'claude-code': [{ type: 'assistant', message: { id: 'a', role: 'assistant', content: [{ type: 'text', text: 'done' }] } }, { type: 'result', subtype: 'success', result: 'done', usage }],
       grok: [{ type: 'text', data: 'done' }, { type: 'end', usage }],
       cursor: [{ type: 'assistant', timestamp_ms: 1, message: { content: [{ type: 'text', text: 'done' }] } }, { type: 'result', subtype: 'success', result: 'done', usage }],
     }
     for (const event of events[agent]) emit(event)
+    if (agent === 'codex') {
+      codex('item/completed', { item: { id: 'a', type: 'agentMessage', text: 'done' } })
+      codexComplete(usage)
+    }
     close()
     await vi.waitFor(() => expect(emitted.mock.calls.filter(([, event]) => event === 'run.completed')).toHaveLength(1))
     expect(emitted.mock.calls.filter(([, event]) => event === 'run.failed')).toHaveLength(0)
@@ -200,12 +231,12 @@ describe('global native usage accounting', () => {
   })
 
   it('keeps scoped chat output intact when a provider returns malformed usage', async () => {
-    start('codex', 'scoped')
+    await start('codex', 'scoped')
     expect(() => manager.handleProxyUsageEvent(sessionId, { type: 'response.completed', data: { response: {
       id: 'bad-usage', usage: { input_tokens: { valueOf: null, toString: null }, output_tokens: 2 },
     } } } as any)).not.toThrow()
-    emit({ type: 'item.completed', item: { id: 'a', type: 'agent_message', text: 'done' } })
-    emit({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } })
+    codex('item/completed', { item: { id: 'a', type: 'agentMessage', text: 'done' } })
+    codexComplete({ input_tokens: 10, output_tokens: 2 })
     close()
     await vi.waitFor(() => expect(emitted.mock.calls.filter(([, event]) => event === 'run.completed')).toHaveLength(1))
     expect(getSessionDetail(sessionId)?.messages.filter(message => message.role === 'assistant').at(-1)?.content).toBe('done')
@@ -215,16 +246,15 @@ describe('global native usage accounting', () => {
   it('releases Codex completion and permits the next turn when usage discovery never resolves', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
     vi.spyOn(nativeModel, 'findRollout').mockImplementation(() => new Promise(() => {}))
-    start('codex')
-    emit({ type: 'thread.started', thread_id: 'native-thread' })
-    emit({ type: 'item.completed', item: { id: 'a', type: 'agent_message', text: 'done' } })
-    emit({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } })
+    await start('codex')
+    codex('item/completed', { item: { id: 'a', type: 'agentMessage', text: 'done' } })
+    codexComplete({ input_tokens: 10, output_tokens: 2 })
     close()
     expect(() => manager.send(sessionId, 'too early')).toThrow('still completing')
     await vi.advanceTimersByTimeAsync(2_500)
     await vi.waitFor(() => expect(emitted.mock.calls.filter(([, event]) => event === 'run.completed')).toHaveLength(1))
     expect(getSessionDetail(sessionId)?.messages.filter(message => message.role === 'assistant').at(-1)?.content).toBe('done')
-    child.exitCode = null
+    mockChild()
     expect(() => manager.send(sessionId, 'next')).not.toThrow()
   })
 
@@ -304,7 +334,7 @@ describe('global native usage accounting', () => {
   })
 
   it('attributes Codex requests to each resumed run and includes compression without replaying cumulative totals', async () => {
-    start('codex')
+    await start('codex')
     const dir = join(workspace, 'sessions', '2026', '10', '01')
     mkdirSync(dir, { recursive: true })
     const file = join(dir, 'rollout-native-thread.jsonl')
@@ -321,15 +351,15 @@ describe('global native usage accounting', () => {
           turn_token_usage: { input_tokens: total, output_tokens: (index + 1) * 2, cached_input_tokens: (index + 1) * 5 } } })
       })
       writeFileSync(file, events.map(row => JSON.stringify(row)).join('\n'))
-      emit({ type: 'thread.started', thread_id: 'native-thread' })
-      emit({ type: 'turn.completed', usage: { input_tokens: 999999, output_tokens: 999 } })
+      codexComplete({ input_tokens: 999999, output_tokens: 999 })
       close()
     }
     turn('first', [10])
     await vi.waitFor(() => expect(getRecordedUsageTotals(sessionId, 'coding_agent').apiCalls).toBe(1))
     await new Promise(resolve => setTimeout(resolve, 2))
-    child.exitCode = null
+    mockChild()
     manager.send(sessionId, 'next')
+    await flushCodexHandshake()
     turn('second', [20, 30])
     await vi.waitFor(() => expect(getRecordedUsageTotals(sessionId, 'coding_agent').apiCalls).toBe(3))
     expect(getRecordedUsageTotals(sessionId, 'coding_agent')).toMatchObject({ inputTokens: 45, outputTokens: 6, cacheReadTokens: 15 })
@@ -338,8 +368,8 @@ describe('global native usage accounting', () => {
     }))
   })
 
-  it.each(['response.failed', 'response.incomplete'] as const)('retains measured scoped usage on %s and deduplicates terminal events', type => {
-    start('codex', 'scoped')
+  it.each(['response.failed', 'response.incomplete'] as const)('retains measured scoped usage on %s and deduplicates terminal events', async type => {
+    await start('codex', 'scoped')
     const data = { response: { id: 'request-error', usage: { input_tokens: 20, output_tokens: 4, input_tokens_details: { cached_tokens: 10 } } } }
     manager.handleProxyUsageEvent(sessionId, { type, data } as any)
     manager.handleProxyUsageEvent(sessionId, { type: 'response.completed', data } as any)
@@ -357,7 +387,7 @@ describe('global native usage accounting', () => {
 
   it.each(['codex', 'pi', 'claude-code', 'grok'] as const)('records captured %s events with model attribution', async agentId => {
     const clock = vi.spyOn(performance, 'now').mockReturnValue(1000)
-    start(agentId)
+    await start(agentId)
     if (agentId === 'codex') {
       const dir = join(workspace, 'sessions', '2026', '09', '11')
       mkdirSync(dir, { recursive: true })
@@ -366,11 +396,10 @@ describe('global native usage accounting', () => {
         { type: 'turn_context', timestamp: '2020-01-01T00:00:00Z', payload: { model: 'old-model' } },
         { type: 'turn_context', timestamp: new Date().toISOString(), payload: { model: 'gpt-6-astra' } },
       ].map(row => JSON.stringify(row)).join('\n'))
-      emit({ type: 'thread.started', thread_id: 'native-thread' })
     }
     clock.mockReturnValue(6000)
-    if (agentId !== 'claude-code') emit({
-      codex: { type: 'item.completed', item: { id: 'answer', type: 'agent_message', text: 'done' } },
+    if (agentId === 'codex') codex('item/completed', { item: { id: 'answer', type: 'agentMessage', text: 'done' } })
+    else if (agentId !== 'claude-code') emit({
       pi: { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'done' } },
       grok: { type: 'text', data: 'done' },
     }[agentId])
@@ -409,7 +438,7 @@ describe('global native usage accounting', () => {
   })
 
   it.each(['pi', 'claude-code', 'grok', 'codex'] as const)('%s scoped usage still comes only from the proxy', async agentId => {
-    start(agentId, 'scoped')
+    await start(agentId, 'scoped')
     manager.handleProxyUsageEvent(sessionId, { type: 'response.completed', data: { response: { id: 'proxy-1', model: 'proxy-model', usage: { input_tokens: 12, output_tokens: 3, cost: 0.001 } } } }, 0.5)
     for (const event of fixtures[agentId]) emit(event)
     close()
@@ -535,16 +564,16 @@ describe('global native usage accounting', () => {
     expect(getRecordedUsageTotals(sessionId, 'coding_agent')).toMatchObject({ inputTokens: 10, outputTokens: 5, cacheReadTokens: 20, apiCalls: 1 })
   })
 
-  it('waits for native Codex stdout to drain and retains measured usage on a failed exit', () => {
-    start('codex')
+  it('waits for native Codex stdout to drain and retains measured usage on a failed exit', async () => {
+    await start('codex')
     child.exitCode = 1
     child.emit('exit', 1)
     expect(getUsage(sessionId)).toBeUndefined()
-    emit({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2, cached_input_tokens: 4 } })
-    emit({ type: 'turn.failed', error: { message: 'native failure' } })
+    codexUsage({ input_tokens: 10, output_tokens: 2, cached_input_tokens: 4 })
+    codex('turn/completed', { turn: { id: 'native-turn', status: 'failed', error: { message: 'native failure' } } })
     expect(getUsage(sessionId)).toBeUndefined()
     child.emit('close', 1)
-    expect(getRecordedUsageTotals(sessionId, 'coding_agent')).toMatchObject({ inputTokens: 6, outputTokens: 2, cacheReadTokens: 4 })
+    await vi.waitFor(() => expect(getRecordedUsageTotals(sessionId, 'coding_agent')).toMatchObject({ inputTokens: 6, outputTokens: 2, cacheReadTokens: 4 }))
   })
 
   it('splits a Grok turn across models and preserves explicit model call counts', () => {
@@ -567,16 +596,16 @@ describe('global native usage accounting', () => {
       const clock = vi.spyOn(performance, 'now').mockReturnValue(1000)
       const wall = vi.spyOn(Date, 'now').mockReturnValue(wallStart)
       const at = (seconds: number) => { clock.mockReturnValue(1000 + seconds * 1000); wall.mockReturnValue(wallStart + seconds * 1000) }
-      start(agent)
+      await start(agent)
       const begin = (id: string) => {
-        if (agent === 'codex') emit({ type: 'item.started', item: { id, type: 'mcp_tool_call', tool: 'read_file', arguments: {} } })
+        if (agent === 'codex') codex('item/started', { item: { id, type: 'mcpToolCall', tool: 'read_file', arguments: {} } })
         if (agent === 'pi') emit({ type: 'tool_execution_start', toolCallId: id, toolName: 'read_file', args: {} })
         if (agent === 'claude-code') emit({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id, name: 'read_file', input: {} }] } })
         if (agent === 'grok') emit({ type: 'tool_call', toolCallId: id, toolName: 'read_file', rawInput: {} })
         if (agent === 'cursor') emit({ type: 'tool_call', subtype: 'started', call_id: id, tool_call: { function: { name: 'read_file', arguments: '{}' } } })
       }
       const end = (id: string, from: number, to: number, failed: boolean) => {
-        if (agent === 'codex') emit({ type: 'item.completed', item: { id, type: 'mcp_tool_call', tool: 'read_file', output: 'done', ...(failed ? { error: { message: 'failed' } } : {}) } })
+        if (agent === 'codex') codex('item/completed', { item: { id, type: 'mcpToolCall', tool: 'read_file', output: 'done', ...(failed ? { error: { message: 'failed' } } : {}) } })
         if (agent === 'pi') emit({ type: 'tool_execution_end', toolCallId: id, result: 'done', isError: failed })
         if (agent === 'claude-code') emit({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'done', is_error: failed }] } })
         if (agent === 'grok') emit({ type: 'tool_call_update', toolCallId: id, status: failed ? 'failed' : 'completed', rawOutput: 'done' })
@@ -589,7 +618,7 @@ describe('global native usage accounting', () => {
       at(7); end('b', 3, 7, true)
       at(10)
       const usage = { input_tokens: 10, output_tokens: 20 }
-      if (agent === 'codex') { emit({ type: 'item.completed', item: { id: 'answer', type: 'agent_message', text: 'done' } }); emit({ type: 'turn.completed', usage }) }
+      if (agent === 'codex') { codex('item/completed', { item: { id: 'answer', type: 'agentMessage', text: 'done' } }); codexComplete(usage) }
       if (agent === 'pi') { emit({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'done' }], usage: { input: 10, output: 20 } } }); emit({ type: 'agent_settled' }) }
       if (agent === 'claude-code') emit({ type: 'result', result: 'done', usage })
       if (agent === 'grok') { emit({ type: 'text', data: 'done' }); emit({ type: 'end', usage }) }

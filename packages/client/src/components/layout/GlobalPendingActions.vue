@@ -202,7 +202,7 @@ async function copyApprovalCommand(action: Extract<GlobalPendingAction, { kind: 
 }
 
 function approvalCommand(action: Extract<GlobalPendingAction, { kind: 'chat-approval' | 'group-approval' }>) {
-  if (!action.pending.command) return null
+  if (!action.pending.command?.trim()) return null
   return h('div', { class: 'global-approval-command studio-surface' }, [
     h('div', { class: 'global-approval-command-header' }, [
       h('span', { class: 'global-approval-command-label' }, t('chat.approvalCommand')),
@@ -388,6 +388,9 @@ function createGlobalNotification(action: GlobalPendingAction): NotificationReac
               ? h('div', { class: 'global-approval-description' }, action.pending.description)
               : null,
             approvalCommand(action),
+             'permissionRule' in action.pending && action.pending.permissionRule
+               ? h('div', { class: 'global-approval-description' }, `${t('chat.approvalAlways')}: ${action.pending.permissionRule}`)
+               : null,
           ]),
     action: clarify
       ? () => h(NButton, {

@@ -438,6 +438,7 @@ export interface PendingApproval {
   description: string
   choices: Array<'once' | 'session' | 'always' | 'deny'>
   allowPermanent: boolean
+  permissionRule?: string
   isMemoryWrite: boolean
   requestedAt: number
   countdownDeadline: number
@@ -3402,6 +3403,9 @@ export const useChatStore = defineStore('chat', () => {
       description,
       choices: isMemoryWrite ? ['once', 'deny'] : choices.length ? choices : ['once', 'session', 'deny'],
       allowPermanent: Boolean((evt as any).allow_permanent),
+      permissionRule: Array.isArray((evt as any).execpolicy_amendment)
+        && (evt as any).execpolicy_amendment.every((part: unknown) => typeof part === 'string')
+        ? JSON.stringify((evt as any).execpolicy_amendment) : undefined,
       isMemoryWrite,
       requestedAt: Date.now(),
       countdownDeadline: pendingInteractionDeadline(

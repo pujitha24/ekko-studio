@@ -32,6 +32,7 @@ import { killOwnedProcessTree } from '../../../studio/public/process-tree'
 import { attachPiJsonlReader } from '../pi/jsonl-parser'
 import { normalizePiThinkingLevel } from '../pi/thinking'
 import { compactCodexThread } from '../codex/compact'
+import { CodexAppServerTurn, codexAppServerArgs } from '../codex/app-server-turn'
 import { updateManagedPromptFileSync } from '../prompt-file'
 import { grokSessionExists, startGrokTurnProcess } from '../grok/turn-process'
 import { applyGrokStreamEvent } from '../grok/event-adapter'
@@ -223,6 +224,8 @@ export interface ManagedCodingAgentRun {
   codexPendingUsage?: any
   codexPendingError?: string
   codexTurnFailed?: boolean
+  codexAppServerTurn?: CodexAppServerTurn
+  codexSessionApprovals?: Set<string>
   nativeUsage?: NativeTurnUsage
   nativeTurnStartedAt?: number
   nativeCompletionPending?: boolean
@@ -1132,6 +1135,14 @@ export class CodingAgentRunManager {
 
   resolveApproval(sessionId: string, approvalId: string, choice = 'deny'): { handled: boolean; resolved: boolean } {
     const run = this.getBySession(sessionId)
+    const codexResult = run?.codexAppServerTurn?.resolveApproval(approvalId, String(choice || 'deny').trim().toLowerCase())
+    if (codexResult?.handled) {
+      logger.info({ sessionId, approvalId, choice, resolved: codexResult.resolved },
+        '[coding-agent-run] Codex approval decision received')
+      return codexResult
+    }
+    // Expired/foreign native approvals must not fall through to the Hermes bridge.
+    if (approvalId.startsWith('codex_')) return { handled: true, resolved: false }
     const request = run?.piUiRequests?.get(approvalId)
     if (!run || !request) return { handled: false, resolved: false }
     const normalizedChoice = String(choice || 'deny').trim().toLowerCase()
@@ -1225,6 +1236,12 @@ export class CodingAgentRunManager {
     if (!agentSessionId) return
     const run = this.runs.get(agentSessionId)
     if (!run) return
+    if (run.launch.agentId === 'codex' && run.codexAppServerTurn && !run.acceptingPrintEvent
+      && event.type === 'response.output_text.delta') {
+      // App-server supplies the authoritative text deltas. The provider proxy
+      // observes the same text before the native stream and must not replay it.
+      return
+    }
     const responseEvent = this.normalizeCodexChatTextEvent(run, event)
     if (!responseEvent) return
     const storageSafeResponseEvent = truncateCodingAgentToolOutputEvent(responseEvent)
@@ -1448,6 +1465,10 @@ export class CodingAgentRunManager {
         : ''
     if (!text) return event
     const existing = run.codexChatText || ''
+    if (run.codexAppServerTurn && run.acceptingPrintEvent) {
+      run.codexChatText = `${existing}${text}`
+      return event
+    }
     const baseline = existing || (run.acceptingPrintEvent ? '' : run.printText || '')
     const delta = text.length >= 16 ? appendedTextDelta(baseline, text) : text
     if (!delta) return null
@@ -1546,6 +1567,7 @@ export class CodingAgentRunManager {
     const shouldReportClosed = options.reportClosed !== false && (run.state.isWorking || Boolean(run.currentChild && !run.currentChild.killed))
     if (run.idleTimer) clearTimeout(run.idleTimer)
     if (run.currentChildKillTimer) clearTimeout(run.currentChildKillTimer)
+    run.codexAppServerTurn?.dispose()
     run.nativeAcpTurn?.cancel()
     run.nativeAcpTurn?.dispose()
     run.dshTurn?.cancel()
@@ -3133,18 +3155,10 @@ export class CodingAgentRunManager {
     const promptArgument = run.launch.mode === 'scoped' || run.launch.promptFile
       ? ''
       : normalizeCliPromptArgument(systemPrompt)
-    const commonArgs = [
-      '--json',
+    const args = codexAppServerArgs([
       ...CODEX_REASONING_SUMMARY_ARGS,
-      ...(promptArgument ? ['-c', `developer_instructions=${JSON.stringify(promptArgument)}`] : []),
       ...run.launch.args,
-      ...codexImageArgs(images),
-      '--skip-git-repo-check',
-      '--dangerously-bypass-approvals-and-sandbox',
-    ]
-    const args = run.launch.agentNativeSessionId && run.nativeResumeReady
-      ? ['exec', 'resume', ...commonArgs, run.launch.agentNativeSessionId, '-']
-      : ['exec', ...commonArgs, '--cd', run.launch.workspaceDir, '-']
+    ])
 
     const child = spawnCodingAgentChild(run.launch.command, args, {
       cwd: existsSync(run.launch.workspaceDir) ? run.launch.workspaceDir : homedir(),
@@ -3155,33 +3169,75 @@ export class CodingAgentRunManager {
     })
     run.currentChild = child
 
-    let stdoutBuffer = ''
-    child.stdout?.on('data', (chunk: Buffer) => {
-      this.touch(run)
-      stdoutBuffer += chunk.toString('utf8')
-      const lines = stdoutBuffer.split(/\r?\n/)
-      stdoutBuffer = lines.pop() || ''
-      for (const line of lines) this.handleCodexExecLine(run, line)
-    })
+    const turn = new CodexAppServerTurn(child, {
+      session: id => this.recordCodexNativeSessionId(run, id),
+      event: (method, params) => this.handleCodexProtocolEvent(run, method, params),
+      activity: () => this.touch(run),
+      approval: request => {
+        logger.info({ runId: run.id, sessionId: run.launch.sessionId, approvalId: request.id, choices: request.choices },
+          '[coding-agent-run] Codex approval requested')
+        this.emitToChat(run.launch.sessionId, 'approval.requested', {
+          event: 'approval.requested',
+          session_id: run.launch.sessionId,
+          approval_id: request.id,
+          title: 'Codex',
+          command: request.command,
+          description: request.description,
+          choices: request.choices,
+          allow_permanent: Boolean(request.execpolicyAmendment),
+          ...(request.execpolicyAmendment ? { execpolicy_amendment: request.execpolicyAmendment } : {}),
+          source: 'codex',
+          timeout_ms: request.timeoutMs,
+          remaining_timeout_ms: request.timeoutMs,
+          requested_at: Date.now(),
+        })
+      },
+      approvalResolved: (id, reason) => {
+        logger.info({ runId: run.id, sessionId: run.launch.sessionId, approvalId: id, reason },
+          '[coding-agent-run] Codex approval cleared')
+        this.emitToChat(run.launch.sessionId, 'approval.resolved', {
+          event: 'approval.resolved',
+          session_id: run.launch.sessionId,
+          approval_id: id,
+          choice: 'deny',
+          resolved: true,
+          reason,
+        })
+      },
+      failed: message => {
+        run.codexTurnFailed = true
+        run.codexPendingError = message
+      },
+      inputClosed: () => {
+        if (run.currentChildKillTimer) clearTimeout(run.currentChildKillTimer)
+        run.currentChildKillTimer = setTimeout(() => {
+          if (run.currentChild === child) forceKillChildProcess(child)
+        }, 5_000)
+        run.currentChildKillTimer.unref?.()
+      },
+    }, run.codexSessionApprovals ??= new Set())
+    run.codexAppServerTurn = turn
 
     child.stderr?.on('data', (chunk: Buffer) => {
       this.touch(run)
       const text = appendChildStderr(run, chunk)
-      if (text) logger.debug({ runId: run.id, sessionId: run.launch.sessionId, text }, '[coding-agent-run] codex exec stderr')
+      if (text) logger.debug({ runId: run.id, sessionId: run.launch.sessionId, text }, '[coding-agent-run] codex app-server stderr')
     })
 
-    if (child.stdin) {
-      child.stdin.on('error', (err) => {
-        logger.warn({ err, runId: run.id, sessionId: run.launch.sessionId }, '[coding-agent-run] codex stdin input failed')
-      })
-      child.stdin.end(`${input}\n`)
-    }
+    void turn.start({
+      cwd: run.launch.workspaceDir,
+      text: input,
+      images,
+      ...(run.launch.agentNativeSessionId && run.nativeResumeReady ? { nativeSessionId: run.launch.agentNativeSessionId } : {}),
+      ...(run.launch.mode === 'scoped' ? { model: run.launch.model } : {}),
+      ...(promptArgument ? { developerInstructions: promptArgument } : {}),
+    })
 
     child.on('error', (err) => {
       if (run.currentChildKillTimer) clearTimeout(run.currentChildKillTimer)
       run.currentChildKillTimer = undefined
       run.currentChild = undefined
-      logger.warn({ err, runId: run.id, sessionId: run.launch.sessionId }, '[coding-agent-run] codex exec failed to start')
+      logger.warn({ err, runId: run.id, sessionId: run.launch.sessionId }, '[coding-agent-run] codex app-server failed to start')
       this.handleClaudePrintResponseEvent(run, {
         type: 'response.failed',
         data: {
@@ -3200,12 +3256,16 @@ export class CodingAgentRunManager {
 
     // Native stdout owns global usage. Drain it before final accounting and
     // model lookup; `exit` can precede the last JSONL bytes.
-    child.on(run.launch.mode === 'global' ? 'close' : 'exit', (code: number | null) => {
-      if (stdoutBuffer.trim()) this.handleCodexExecLine(run, stdoutBuffer)
+    child.on('close', (code: number | null) => {
+      turn.dispose()
+      if (run.codexAppServerTurn === turn) run.codexAppServerTurn = undefined
+      if (run.codexPendingError === 'Codex app-server closed before the turn completed' && code !== 0) {
+        run.codexPendingError = exitErrorMessage('Codex', code, run.currentChildStderr)
+      }
       if (run.currentChildKillTimer) clearTimeout(run.currentChildKillTimer)
       run.currentChildKillTimer = undefined
       run.currentChild = undefined
-      logger.info({ runId: run.id, sessionId: run.launch.sessionId, code }, '[coding-agent-run] codex exec exited')
+      logger.info({ runId: run.id, sessionId: run.launch.sessionId, code }, '[coding-agent-run] codex app-server exited')
       const nativeSessionId = run.launch.agentNativeSessionId
       if (run.launch.mode === 'global' && nativeSessionId && run.nativeTurnStartedAt) {
         const home = run.launch.env?.CODEX_HOME || process.env.CODEX_HOME || join(getCodingAgentGlobalHome(), '.codex')
@@ -3221,13 +3281,13 @@ export class CodingAgentRunManager {
             }
             return
           }
-          this.finishCodexExecTurn(run, code)
+          this.finishCodexExecTurn(run, turn.completed ? 0 : code)
         }).catch(err => {
           run.nativeCompletionPending = false
           logger.warn({ err, runId: run.id }, '[coding-agent-run] failed to read native model metadata')
-          if (!run.exited && !run.stoppedByUser) this.finishCodexExecTurn(run, code)
+          if (!run.exited && !run.stoppedByUser) this.finishCodexExecTurn(run, turn.completed ? 0 : code)
         })
-      } else this.finishCodexExecTurn(run, code)
+      } else this.finishCodexExecTurn(run, turn.completed ? 0 : code)
     })
   }
 
@@ -3326,13 +3386,15 @@ export class CodingAgentRunManager {
       return
     }
     if (method === 'item/agentMessage/delta' || method === 'item/assistantMessage/delta') {
-      this.appendCodexText(run, String(params.delta || params.text || ''))
+      this.appendCodexText(run, String(params.delta || params.text || ''), true)
       return
     }
     if (
       method === 'item/reasoning/delta' ||
       method === 'item/reasoningText/delta' ||
       method === 'item/reasoningSummary/delta' ||
+      method === 'item/reasoning/summaryTextDelta' ||
+      method === 'item/reasoning/textDelta' ||
       method === 'item/thinking/delta'
     ) {
       this.appendCodexReasoning(run, this.codexReasoningText(params))
@@ -3350,6 +3412,15 @@ export class CodingAgentRunManager {
       run.codexPendingUsage = params.usage
       return
     }
+    if (method === 'thread/tokenUsage/updated') {
+      const usage = params.tokenUsage?.last
+      if (usage) run.codexPendingUsage = {
+        input_tokens: usage.inputTokens,
+        cached_input_tokens: usage.cachedInputTokens,
+        output_tokens: usage.outputTokens,
+      }
+      return
+    }
     if (method === 'turn/failed') {
       run.codexTurnFailed = true
       run.codexPendingUsage = params.usage ?? run.codexPendingUsage
@@ -3359,6 +3430,7 @@ export class CodingAgentRunManager {
       return
     }
     if (method === 'error') {
+      if (params.willRetry === true) return
       this.deferCodexExecError(run, params.error?.message || params.message || 'Codex run failed')
     }
   }
@@ -3506,6 +3578,7 @@ export class CodingAgentRunManager {
 
   private codexItemType(item: any): string {
     return String(item?.type || item?.item_type || item?.itemType || '').trim()
+      .replace(/[A-Z]/g, char => `_${char.toLowerCase()}`)
   }
 
   private isCodexToolItem(itemType: string): boolean {
@@ -3557,12 +3630,12 @@ export class CodingAgentRunManager {
         ? { server: item.server, tool: item.tool || item.name, arguments: item.arguments || item.input }
         : itemType === 'web_search'
           ? { query: item.query || item.text || '' }
-          : { path: item.path || item.file || '', action: item.action || item.change || '' }
+          : { path: item.path || item.file || '', action: item.action || item.change || '', ...(item.changes ? { changes: item.changes } : {}) }
     return { id, name, arguments: JSON.stringify(args), done: false }
   }
 
   private codexToolOutput(item: any): string {
-    const value = item.aggregated_output ?? item.output ?? item.result ?? item.error?.message ?? ''
+    const value = item.aggregated_output ?? item.aggregatedOutput ?? item.output ?? item.result ?? item.error?.message ?? ''
     if (typeof value === 'string') return value
     try {
       return JSON.stringify(value)
@@ -3871,7 +3944,9 @@ export class CodingAgentRunManager {
   private emitToChat(sessionId: string, event: string, payload: any) {
     try {
       getChatRunServer()?.emitExternalEvent?.(sessionId, event, payload)
-    } catch {}
+    } catch (err) {
+      logger.warn({ err, sessionId, event }, '[coding-agent-run] failed to emit chat event')
+    }
   }
 
   private emitTerminalStatus(run: ManagedCodingAgentRun, text: string) {

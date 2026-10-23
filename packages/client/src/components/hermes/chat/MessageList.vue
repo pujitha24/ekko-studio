@@ -1111,8 +1111,11 @@ defineExpose({
             <PendingInteractionCountdown :deadline="visibleApproval.countdownDeadline" />
           </div>
           <div class="approval-float-title">{{ t("chat.approvalTitle") }}</div>
-          <div class="approval-float-desc">{{ visibleApproval.description }}</div>
-          <code class="approval-float-command">{{ visibleApproval.command }}</code>
+          <div v-if="visibleApproval.description?.trim()" class="approval-float-desc">{{ visibleApproval.description }}</div>
+          <code v-if="visibleApproval.command?.trim()" class="approval-float-command">{{ visibleApproval.command }}</code>
+          <div v-if="visibleApproval.permissionRule" class="approval-float-desc">
+            {{ t("chat.approvalAlways") }}: {{ visibleApproval.permissionRule }}
+          </div>
           <div class="approval-float-actions">
             <NButton
               v-if="visibleApproval.isMemoryWrite"

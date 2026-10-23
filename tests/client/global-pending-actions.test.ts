@@ -432,6 +432,29 @@ describe('GlobalPendingActions', () => {
     expect(preview.get('button').text()).toBe('common.copied')
   })
 
+  it('uses the existing buttons and shows a native persistent rule without an empty command box', async () => {
+    chatState.pendingApprovals = new Map([['session-b', {
+      sessionId: 'session-b', approvalId: 'approval-b', description: 'Review permission', command: '  ',
+      choices: ['once', 'session', 'always', 'deny'], permissionRule: '["echo","test"]',
+      countdownDeadline: Date.now() + 300000,
+    }]])
+    chatState.respondApprovalFor.mockReturnValueOnce('submitted')
+    const wrapper = mount(GlobalPendingActions)
+    await nextTick()
+    const content = await render(created[0].options.content)
+    expect(content.find('.global-approval-command').exists()).toBe(false)
+    expect(content.text()).toContain('chat.approvalAlways: ["echo","test"]')
+    const action = await render(created[0].options.action)
+    expect(action.findAll('button').map(button => button.text())).toEqual([
+      'chat.approvalAllowOnce', 'chat.approvalAllowSession', 'chat.approvalAlways', 'chat.approvalDeny',
+    ])
+    await action.findAll('button')[2]!.trigger('click')
+    expect(chatState.respondApprovalFor).toHaveBeenCalledWith('session-b', 'approval-b', 'always')
+    content.unmount()
+    action.unmount()
+    wrapper.unmount()
+  })
+
   it('reports a failed approval command copy without showing copied feedback', async () => {
     clipboardMock.copyToClipboard.mockResolvedValueOnce(false)
     chatState.pendingApprovals = new Map([['session-b', {

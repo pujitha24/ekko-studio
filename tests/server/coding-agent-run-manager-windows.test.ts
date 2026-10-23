@@ -43,7 +43,18 @@ vi.mock('child_process', () => ({
     const child = new testState.TestEmitter() as any
     child.stdin = new testState.TestEmitter()
     child.stdin.end = vi.fn()
-    child.stdin.write = vi.fn()
+    child.stdin.writable = true
+    child.stdin.write = vi.fn((data: string) => {
+      if (!args.some(arg => arg.includes('app-server'))) return
+      const message = JSON.parse(data)
+      let result: any
+      if (message.method === 'initialize') result = {}
+      if (message.method === 'thread/start' || message.method === 'thread/resume') {
+        result = { thread: { id: message.params.threadId || 'native-codex-thread' } }
+      }
+      if (message.method === 'turn/start') result = { turn: { id: 'native-codex-turn' } }
+      if (result) queueMicrotask(() => child.stdout.emit('data', Buffer.from(`${JSON.stringify({ id: message.id, result })}\n`)))
+    })
     child.stdout = new testState.TestEmitter()
     child.stderr = new testState.TestEmitter()
     child.pid = 1234
@@ -60,6 +71,7 @@ vi.mock('child_process', () => ({
 
 vi.mock('../../packages/server/src/modules/studio/repositories/session-store', async (importOriginal) => ({
   ...await importOriginal<typeof import('../../packages/server/src/modules/studio/repositories/session-store')>(),
+  addMessage: vi.fn(() => 1),
   updateSessionStats: vi.fn(),
 }))
 
@@ -74,6 +86,10 @@ const windowsCmd = process.env.comspec || 'cmd.exe'
 
 function setPlatform(platform: NodeJS.Platform) {
   Object.defineProperty(process, 'platform', { value: platform })
+}
+
+async function flushCodexHandshake() {
+  for (let index = 0; index < 10; index++) await Promise.resolve()
 }
 
 beforeEach(() => {
@@ -1077,7 +1093,7 @@ describe('coding agent Windows process launch', () => {
     ;(manager as any).sessionIndex.clear()
   })
 
-  it('runs npm .cmd shims through cmd.exe for hidden Codex chat turns', () => {
+  it('runs npm .cmd shims through cmd.exe for hidden Codex chat turns', async () => {
     const manager = new CodingAgentRunManager()
     ;(manager as any).ensureDbSession = () => {}
     ;(manager as any).addUserMessage = () => {}
@@ -1108,21 +1124,22 @@ describe('coding agent Windows process launch', () => {
       '当前消息：检查这个问题',
     ].join('\n')
     manager.send('chat-session-codex-1', groupInput, { systemPrompt: 'system prompt\nsecond line' })
+    await flushCodexHandshake()
 
     expect(testState.spawnCalls[0]).toMatchObject({
       command: windowsCmd,
       args: expect.arrayContaining(['/d', '/s', '/c']),
     })
     expect(testState.spawnCalls[0].args[3]).toContain('C:\\Users\\Administrator\\AppData\\Roaming\\npm\\codex.cmd')
-    expect(testState.spawnCalls[0].args[3]).toContain('^"exec^"')
+    expect(testState.spawnCalls[0].args[3]).toContain('^"app-server^"')
     expect(testState.spawnCalls[0].args[3]).toContain('^"-c^"')
     expect(testState.spawnCalls[0].args[3]).toContain('model_reasoning_summary=\\^"auto\\^"')
     expect(testState.spawnCalls[0].args[3]).not.toContain('developer_instructions=')
     expect(testState.spawnCalls[0].args[3]).not.toContain('system^ prompt^ /^ second^ line')
     expect(testState.spawnCalls[0].args[3]).not.toContain('\n')
     expect(testState.spawnCalls[0].args[3]).not.toContain('\r')
-    expect(testState.spawnCalls[0].args[3]).toContain('^"--model^"')
-    expect(testState.spawnCalls[0].args[3]).toContain('^"-^"')
+    expect(testState.spawnCalls[0].args[3]).toContain('model=\\^"gpt-test\\^"')
+    expect(testState.spawnCalls[0].args[3]).not.toContain('dangerously-bypass')
     expect(testState.spawnCalls[0].args[3]).not.toContain('群聊系统')
     expect(testState.spawnCalls[0].args[3].length).toBeLessThan(8191)
     expect(testState.spawnCalls[0].args[3]).not.toContain('system^ prompt\r\n\r\ntest')
@@ -1131,10 +1148,89 @@ describe('coding agent Windows process launch', () => {
       windowsVerbatimArguments: true,
       windowsHide: true,
     })
-    expect(testState.spawnCalls[0].child.stdin.end).toHaveBeenCalledWith(`${groupInput}\n`)
+    expect(testState.spawnCalls[0].child.stdin.write.mock.calls.map(([data]: [string]) => JSON.parse(data)))
+      .toContainEqual(expect.objectContaining({
+        method: 'turn/start',
+        params: expect.objectContaining({ input: [{ type: 'text', text: groupInput, text_elements: [] }] }),
+      }))
+    expect(testState.spawnCalls[0].child.stdin.end).not.toHaveBeenCalled()
 
     const run = (manager as any).runs.get('agent-session-codex-1')
     if (run?.idleTimer) clearTimeout(run.idleTimer)
+    ;(manager as any).runs.clear()
+    ;(manager as any).sessionIndex.clear()
+  })
+
+  it.each([
+    ['short Chinese chunks', ['我会', '创建文件', '，然后等待审批。']],
+    ['legitimate repeated chunks', ['这是同一原生消息中刻意重复的一段完整文本。', '这是同一原生消息中刻意重复的一段完整文本。']],
+  ] as Array<[string, string[]]>)('uses native Codex text once instead of replaying proxy deltas: %s', async (_name, chunks) => {
+    const manager = new CodingAgentRunManager()
+    const emitted = vi.fn()
+    ;(manager as any).ensureDbSession = vi.fn()
+    ;(manager as any).addUserMessage = vi.fn()
+    ;(manager as any).emitToChat = emitted
+    manager.start({
+      agentSessionId: 'codex-text-run', agentId: 'codex', mode: 'scoped',
+      profile: 'default', provider: 'test', model: 'test', sessionId: 'codex-text-session',
+      command: 'codex.cmd', args: [], shellCommand: 'codex', workspaceDir: process.cwd(),
+      state: { messages: [], isWorking: false, events: [], queue: [] },
+    })
+    try {
+      manager.send('codex-text-session', 'hello')
+      await flushCodexHandshake()
+      const child = testState.spawnCalls[0]!.child
+      const frame = (method: string, params: Record<string, unknown>) => child.stdout.emit('data',
+        Buffer.from(JSON.stringify({ method, params: {
+          threadId: 'native-codex-thread', turnId: 'native-codex-turn', ...params,
+        } }) + '\n'))
+      for (const delta of chunks) {
+        manager.handleResponseEvent('codex-text-run', { type: 'response.output_text.delta', data: { delta } })
+        frame('item/agentMessage/delta', { itemId: 'text-item', delta })
+      }
+      frame('item/completed', { item: { id: 'text-item', type: 'agentMessage', text: chunks.join('') } })
+      const text = emitted.mock.calls.filter(([, event]) => event === 'message.delta')
+        .map(([, , payload]) => payload.delta).join('')
+      expect(text).toBe(chunks.join(''))
+      const run = (manager as any).runs.get('codex-text-run')
+      expect(run.codexChatText).toBe(chunks.join(''))
+    } finally {
+      manager.shutdown()
+    }
+  })
+
+  it('routes Codex approvals only to their owning Studio session', async () => {
+    const manager = new CodingAgentRunManager()
+    const emitted = vi.fn()
+    ;(manager as any).ensureDbSession = vi.fn()
+    ;(manager as any).addUserMessage = vi.fn()
+    ;(manager as any).emitToChat = emitted
+    manager.start({
+      agentSessionId: 'codex-approval-run', agentId: 'codex', mode: 'scoped',
+      profile: 'default', provider: 'test', model: 'test', sessionId: 'codex-approval-session',
+      command: 'codex.cmd', args: [], shellCommand: 'codex', workspaceDir: process.cwd(),
+      state: { messages: [], isWorking: false, events: [], queue: [] },
+    })
+    manager.send('codex-approval-session', 'hello')
+    await flushCodexHandshake()
+    const child = testState.spawnCalls[0]!.child
+    child.stdout.emit('data', Buffer.from(`${JSON.stringify({
+      id: 'command-approval', method: 'item/commandExecution/requestApproval',
+      params: { threadId: 'native-codex-thread', turnId: 'native-codex-turn', itemId: 'command-item', command: 'echo test' },
+    })}\n`))
+    const approval = emitted.mock.calls.find(([, event]) => event === 'approval.requested')![2]
+    expect(approval).toMatchObject({
+      source: 'codex', title: 'Codex', choices: ['once', 'session', 'deny'], command: 'echo test',
+      description: '', allow_permanent: false,
+    })
+    expect(manager.resolveApproval('other-session', approval.approval_id, 'once')).toEqual({ handled: true, resolved: false })
+    expect(manager.resolveApproval('codex-approval-session', approval.approval_id, 'once')).toEqual({ handled: true, resolved: true })
+    expect(child.stdin.write.mock.calls.map(([data]: [string]) => JSON.parse(data)))
+      .toContainEqual({ jsonrpc: '2.0', id: 'command-approval', result: { decision: 'accept' } })
+    expect(manager.resolveApproval('codex-approval-session', approval.approval_id, 'once')).toEqual({ handled: true, resolved: false })
+    const run = (manager as any).runs.get('codex-approval-run')
+    run.codexAppServerTurn.dispose()
+    clearTimeout(run.idleTimer)
     ;(manager as any).runs.clear()
     ;(manager as any).sessionIndex.clear()
   })
@@ -1298,7 +1394,7 @@ describe('coding agent Windows process launch', () => {
     }
   })
 
-  it('passes image paths to hidden Codex turns with --image', () => {
+  it('passes image paths to hidden Codex turns over JSON-RPC stdin', async () => {
     const manager = new CodingAgentRunManager()
     ;(manager as any).ensureDbSession = () => {}
     ;(manager as any).addUserMessage = () => {}
@@ -1327,14 +1423,21 @@ describe('coding agent Windows process launch', () => {
         mediaType: 'image/png',
       }],
     })
+    await flushCodexHandshake()
 
     const call = testState.spawnCalls[0]
-    expect(call.args[3]).toContain('^"--image^"')
-    expect(call.args[3]).toContain('C:\\Users\\Administrator\\Pictures\\sample^ image.png')
-    expect(call.args[3]).toContain('^"-^"')
+    expect(call.args[3]).toContain('^"app-server^"')
+    expect(call.args[3]).not.toContain('sample^ image.png')
     expect(call.args[3]).not.toContain('^"inspect^ this^ image^"')
     expect(call.options.stdio).toEqual(['pipe', 'pipe', 'pipe'])
-    expect(call.child.stdin.end).toHaveBeenCalledWith('inspect this image\n')
+    expect(call.child.stdin.write.mock.calls.map(([data]: [string]) => JSON.parse(data)))
+      .toContainEqual(expect.objectContaining({
+        method: 'turn/start',
+        params: expect.objectContaining({ input: [
+          { type: 'text', text: 'inspect this image', text_elements: [] },
+          { type: 'localImage', path: 'C:\\Users\\Administrator\\Pictures\\sample image.png' },
+        ] }),
+      }))
 
     const run = (manager as any).runs.get('agent-session-codex-image-1')
     if (run?.idleTimer) clearTimeout(run.idleTimer)
@@ -1529,8 +1632,9 @@ describe('coding agent Windows process launch', () => {
     })
 
     manager.send('chat-session-codex-error-1', 'test')
+    await flushCodexHandshake()
     testState.spawnCalls[0].child.stderr.emit('data', Buffer.from([0xb2, 0xbb, 0xca, 0xc7]))
-    testState.spawnCalls[0].child.emit('exit', 1)
+    testState.spawnCalls[0].child.emit('close', 1)
     await new Promise(resolve => setTimeout(resolve, 0))
 
     expect(emitted).toContainEqual(expect.objectContaining({
