@@ -19,7 +19,7 @@ function fixture(sessionApprovals?: Set<string>) {
     },
   })
   const callbacks = {
-    session: vi.fn(), event: vi.fn(), approval: vi.fn(), approvalResolved: vi.fn(),
+    clarification: vi.fn(), clarificationResolved: vi.fn(), session: vi.fn(), event: vi.fn(), approval: vi.fn(), approvalResolved: vi.fn(),
     failed: vi.fn(), activity: vi.fn(), inputClosed: vi.fn(),
   }
   const turn = new CodexAppServerTurn(child, callbacks, sessionApprovals)
@@ -281,5 +281,126 @@ describe('Codex app-server chat transport', () => {
     expect(codexAppServerArgs(['--model', 'custom', '-c', 'model_reasoning_effort="high"'])).toEqual([
       'app-server', '--stdio', '-c', 'model="custom"', '-c', 'model_reasoning_effort="high"',
     ])
+  })
+})
+
+// Regression evidence for the omitted native interaction methods. This suite
+// intentionally stays on the isolated repair branch until the bridge is fixed.
+describe('Codex missing interaction RPC regressions', () => {
+  it.each([
+    ['mcpServer/elicitation/request', { serverName: 'test', mode: 'form', message: 'Confirm', requestedSchema: { type: 'object', properties: {} } }],
+    ['item/tool/requestUserInput', { questions: [{ id: 'q1', header: 'Confirm', question: 'Proceed?', options: [{ label: 'Accept', description: 'Run' }, { label: 'Decline', description: 'Stop' }] }] }],
+    ['item/permissions/requestApproval', { permissions: { network: { enabled: true } } }],
+  ])('does not discard %s as an unknown client method', async (method, params) => {
+    const f = fixture()
+    await f.start()
+    f.send({ id: 'interaction-1', method, params: { threadId: 'thread-1', turnId: 'turn-1', ...params } })
+    expect(f.writes.find(message => message.id === 'interaction-1')?.error?.code).not.toBe(-32601)
+    f.turn.dispose()
+  })
+})
+
+describe('Codex interactive consent boundaries', () => {
+  const form = { serverName: 'local-test', mode: 'form', message: 'Supply input', requestedSchema: {
+    type: 'object', properties: { name: { type: 'string' }, enabled: { type: 'boolean' } }, required: ['name'],
+  } }
+  const request = (f: ReturnType<typeof fixture>, method: string, params: object = {}, id = 'rpc') => f.send({
+    id, method, params: { threadId: 'thread-1', turnId: 'turn-1', ...params },
+  })
+  it('validates form input, never replies before consent, and resolves only once', async () => {
+    const f = fixture(); await f.start()
+    request(f, 'mcpServer/elicitation/request', form)
+    const id = f.callbacks.clarification.mock.calls[0]![0].id
+    expect(f.writes.some(m => m.id === 'rpc')).toBe(false)
+    expect(f.turn.resolveClarification(id, '{"enabled":"yes"}').resolved).toBe(false)
+    expect(f.turn.resolveClarification(id, '{"name":"test","extra":true}').resolved).toBe(false)
+    expect(f.turn.resolveClarification(id, '{"name":"test","enabled":true}').resolved).toBe(true)
+    expect(f.writes.at(-1).result).toEqual({ action: 'accept', content: { name: 'test', enabled: true } })
+    expect(f.turn.resolveClarification(id, '{}').handled).toBe(false)
+    f.turn.dispose()
+  })
+  it('allows missing MCP turn correlation, but cancels requests for foreign threads or turns', async () => {
+    const f = fixture(); await f.start()
+    request(f, 'mcpServer/elicitation/request', { ...form, turnId: null })
+    expect(f.callbacks.clarification).toHaveBeenCalledOnce()
+    request(f, 'mcpServer/elicitation/request', { ...form, threadId: 'foreign' }, 'foreign')
+    request(f, 'mcpServer/elicitation/request', { ...form, turnId: 'old' }, 'old')
+    expect(f.writes.slice(-2).map(m => m.result)).toEqual([{ action: 'cancel', content: null }, { action: 'cancel', content: null }])
+    f.turn.dispose()
+  })
+  it('ignores duplicates and clears input on native resolution without sending a second response', async () => {
+    const f = fixture(); await f.start()
+    request(f, 'mcpServer/elicitation/request', form)
+    request(f, 'mcpServer/elicitation/request', form)
+    expect(f.callbacks.clarification).toHaveBeenCalledOnce()
+    const id = f.callbacks.clarification.mock.calls[0]![0].id
+    f.send({ method: 'serverRequest/resolved', params: { threadId: 'thread-1', requestId: 'rpc' } })
+    expect(f.turn.resolveClarification(id, '{}').handled).toBe(false)
+    expect(f.writes.some(m => m.id === 'rpc')).toBe(false)
+    expect(f.callbacks.clarificationResolved).toHaveBeenCalledOnce()
+    f.turn.dispose()
+  })
+  it('uses protocol cancellation on timeout and disposal', async () => {
+    vi.useFakeTimers()
+    const f = fixture(); await f.start()
+    request(f, 'mcpServer/elicitation/request', form)
+    await vi.advanceTimersByTimeAsync(CODEX_APPROVAL_TIMEOUT_MS)
+    expect(f.writes.at(-1).result).toEqual({ action: 'cancel', content: null })
+    request(f, 'item/tool/requestUserInput', { questions: [{ id: 'q', question: 'Choose', options: null }] }, 'input')
+    f.turn.dispose()
+    expect(f.writes.at(-1)).toMatchObject({ id: 'input', result: { answers: {} } })
+  })
+  it('restricts permissions to turn scope and never offers session or always grants', async () => {
+    const f = fixture(); await f.start()
+    const permissions = { network: { enabled: true } }
+    request(f, 'item/permissions/requestApproval', { permissions })
+    const prompt = f.callbacks.approval.mock.calls[0]![0]
+    expect(prompt.choices).toEqual(['once', 'deny'])
+    expect(f.turn.resolveApproval(prompt.id, 'session').resolved).toBe(false)
+    expect(f.turn.resolveApproval(prompt.id, 'once').resolved).toBe(true)
+    expect(f.writes.at(-1).result).toEqual({ permissions, scope: 'turn' })
+    request(f, 'item/permissions/requestApproval', { permissions }, 'deny')
+    f.turn.dispose()
+    expect(f.writes.at(-1).result).toEqual({ permissions: {}, scope: 'turn' })
+  })
+  it('presents URL consent without opening it and supports explicit refusal', async () => {
+    const f = fixture(); await f.start()
+    request(f, 'mcpServer/elicitation/request', { serverName: 'test', mode: 'url', url: 'https://example.com/authorize', elicitationId: 'auth', message: 'Complete in your browser' })
+    const prompt = f.callbacks.approval.mock.calls[0]![0]
+    expect(prompt.description).toContain('https://example.com/authorize')
+    f.turn.resolveApproval(prompt.id, 'deny')
+    expect(f.writes.at(-1).result).toEqual({ action: 'decline', content: null })
+    request(f, 'mcpServer/elicitation/request', { ...form, mode: 'url', url: 'javascript:alert(1)' }, 'bad')
+    expect(f.writes.at(-1).result).toEqual({ action: 'cancel', content: null })
+    f.turn.dispose()
+  })
+  it('maps multiple questions without allowing unoffered choices or foreign question IDs', async () => {
+    const f = fixture(); await f.start()
+    request(f, 'item/tool/requestUserInput', { questions: [
+      { id: 'first', question: 'Choose', options: [{ label: 'Accept', description: 'Continue' }] },
+      { id: 'second', question: 'Explain', options: null },
+    ] })
+    const id = f.callbacks.clarification.mock.calls[0]![0].id
+    expect(f.turn.resolveClarification(id, '{"first":["Invented"],"second":["ok"]}').resolved).toBe(false)
+    expect(f.turn.resolveClarification(id, '{"first":["Accept"],"second":["ok"],"extra":[]}').resolved).toBe(false)
+    expect(f.turn.resolveClarification(id, '{"first":["Accept"],"second":["ok"]}').resolved).toBe(true)
+    expect(f.writes.at(-1).result).toEqual({ answers: { first: { answers: ['Accept'] }, second: { answers: ['ok'] } } })
+    f.turn.dispose()
+  })
+  it('does not collect secret answers in the persistent clarification UI', async () => {
+    const f = fixture(); await f.start()
+    request(f, 'item/tool/requestUserInput', { questions: [{ id: 'secret', question: 'Token', isSecret: true }] })
+    expect(f.callbacks.clarification).not.toHaveBeenCalled()
+    expect(f.writes.at(-1).result).toEqual({ answers: {} })
+    f.turn.dispose()
+  })
+  it('never accepts unsupported form constraints', async () => {
+    const f = fixture(); await f.start()
+    request(f, 'mcpServer/elicitation/request', { ...form, requestedSchema: { type: 'object', properties: { name: { type: 'string', pattern: '^x' } } } })
+    const id = f.callbacks.clarification.mock.calls[0]![0].id
+    expect(f.turn.resolveClarification(id, '{"name":"wrong"}').resolved).toBe(false)
+    f.turn.resolveClarification(id, '')
+    expect(f.writes.at(-1).result).toEqual({ action: 'cancel', content: null })
+    f.turn.dispose()
   })
 })

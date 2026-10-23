@@ -1892,3 +1892,29 @@ test('keeps stored unclosed leading thinking text out of the reply after reload'
   }
   expect(api.unexpectedRequests).toEqual([])
 })
+
+test('Codex MCP form uses explicit clarification and serializes the exact user response', async ({ page }) => {
+  await authenticate(page, TEST_ACCESS_KEY, 'research')
+  await mockHermesApi(page)
+  await mockChatSocket(page)
+  await page.goto('/#/hermes/chat')
+  await sendChatMessage(page, 'Use the MCP tool')
+  const { run } = await waitForRun(page)
+  await page.evaluate(sid => {
+    const socket = (window as any).__PW_CHAT_SOCKET__.latest
+    socket.__trigger('run.started', { event: 'run.started', session_id: sid, run_id: 'codex-mcp' })
+    socket.__trigger('clarify.requested', {
+      event: 'clarify.requested', session_id: sid, clarify_id: 'codex_input_form',
+      source: 'codex', question: 'MCP test form: provide JSON input', choices: null,
+      response_mode: 'editor', timeout_ms: 300000,
+    })
+  }, run.session_id)
+  await expect(page.getByText('MCP test form: provide JSON input')).toBeVisible()
+  const response = '{"name":"explicit user input"}'
+  await page.getByPlaceholder('Type your answer...').fill(response)
+  await page.getByRole('button', { name: 'Reply', exact: true }).click()
+  await expect.poll(() => page.evaluate(() => (window as any).__PW_CHAT_SOCKET__.emitted
+    .filter((entry: any) => entry.event === 'clarify.respond'))).toEqual([{
+    event: 'clarify.respond', payload: { session_id: run.session_id, clarify_id: 'codex_input_form', response },
+  }])
+})

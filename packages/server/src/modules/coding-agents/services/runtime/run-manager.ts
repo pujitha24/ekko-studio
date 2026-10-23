@@ -1163,6 +1163,9 @@ export class CodingAgentRunManager {
 
   resolveClarification(sessionId: string, clarifyId: string, responseValue = ''): { handled: boolean; resolved: boolean } {
     const run = this.getBySession(sessionId)
+    const codexResult = run?.codexAppServerTurn?.resolveClarification(clarifyId, String(responseValue ?? ''))
+    if (codexResult?.handled) return codexResult
+    if (clarifyId.startsWith('codex_input_')) return { handled: true, resolved: false }
     const request = run?.piUiRequests?.get(clarifyId)
     if (!run || !request || !['select', 'input', 'editor'].includes(request.method)) {
       return { handled: Boolean(run && request), resolved: false }
@@ -3190,6 +3193,21 @@ export class CodingAgentRunManager {
           timeout_ms: request.timeoutMs,
           remaining_timeout_ms: request.timeoutMs,
           requested_at: Date.now(),
+        })
+      },
+      clarification: request => {
+        this.emitToChat(run.launch.sessionId, 'clarify.requested', {
+          event: 'clarify.requested', session_id: run.launch.sessionId,
+          clarify_id: request.id, question: request.question, choices: request.choices,
+          response_mode: request.choices ? 'select' : 'editor', source: 'codex',
+          timeout_ms: request.timeoutMs, remaining_timeout_ms: request.timeoutMs,
+          requested_at: Date.now(),
+        })
+      },
+      clarificationResolved: (id, reason) => {
+        this.emitToChat(run.launch.sessionId, 'clarify.resolved', {
+          event: 'clarify.resolved', session_id: run.launch.sessionId,
+          clarify_id: id, resolved: true, reason,
         })
       },
       approvalResolved: (id, reason) => {

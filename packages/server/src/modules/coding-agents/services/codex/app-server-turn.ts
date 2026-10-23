@@ -1,3 +1,4 @@
+import { parseMcpForm } from './interaction'
 import type { ChildProcess } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { StringDecoder } from 'node:string_decoder'
@@ -17,11 +18,14 @@ interface PendingApproval {
   rpcId: string | number
   timer: ReturnType<typeof setTimeout>
   choices: string[]
+  result?: (choice: string) => object
   sessionKey?: string
   execpolicyAmendment?: string[]
 }
 
 interface Callbacks {
+  clarification?(request: { id: string; question: string; choices: string[] | null; timeoutMs: number }): void
+  clarificationResolved?(id: string, reason: string): void
   session(id: string): void
   event(method: string, params: any): void
   approval(request: {
@@ -43,6 +47,7 @@ export class CodexAppServerTurn {
   private sequence = 0
   private pending = new Map<number, PendingRequest>()
   private approvals = new Map<string, PendingApproval>()
+  private interactions = new Map<string, { rpcId: string | number; timer: ReturnType<typeof setTimeout>; respond: (value: string) => object; cancel: object }>()
   private decoder = new StringDecoder('utf8')
   private buffer = ''
   private closed = false
@@ -171,6 +176,7 @@ export class CodexAppServerTurn {
 
   private serverRequest(message: any) {
     const params = message.params || {}
+    if (this.interactionRequest(message)) return
     if (!['item/commandExecution/requestApproval', 'item/fileChange/requestApproval'].includes(message.method)) {
       this.write({ id: message.id, error: { code: -32601, message: 'Unsupported Codex client method' } })
       return
@@ -182,7 +188,7 @@ export class CodexAppServerTurn {
       this.write({ id: message.id, result: { decision: 'decline' } })
       return
     }
-    if ([...this.approvals.values()].some(request => request.rpcId === message.id)) return
+    if ([...this.approvals.values(), ...this.interactions.values()].some(request => request.rpcId === message.id)) return
     const sessionKey = this.commandSessionKey(message.method, params)
     if (sessionKey && this.sessionApprovals.has(sessionKey)) {
       this.write({ id: message.id, result: { decision: 'acceptForSession' } })
@@ -210,6 +216,99 @@ export class CodexAppServerTurn {
     })
   }
 
+  private interactionRequest(message: any): boolean {
+    const method = message.method
+    if (!['mcpServer/elicitation/request', 'item/tool/requestUserInput', 'tool/requestUserInput', 'item/permissions/requestApproval'].includes(method)) return false
+    const p = message.params || {}
+    const isMcp = method === 'mcpServer/elicitation/request'
+    const permission = method === 'item/permissions/requestApproval'
+    const cancel = isMcp ? { action: 'cancel', content: null } : permission ? { permissions: {}, scope: 'turn' } : { answers: {} }
+    if (!this.threadId || p.threadId !== this.threadId || !this.turnId || this.completed
+      || (p.turnId ? p.turnId !== this.turnId : !isMcp)) {
+      this.write({ id: message.id, result: cancel }); return true
+    }
+    if ([...this.interactions.values(), ...this.approvals.values()].some(request => request.rpcId === message.id)) return true
+    // Studio currently renders one clarification and one approval per session.
+    // Do not replace a pending prompt and strand its native RPC.
+    if (this.interactions.size || this.approvals.size) {
+      this.write({ id: message.id, result: cancel }); return true
+    }
+    if (isMcp && !['form', 'url'].includes(p.mode)) {
+      this.write({ id: message.id, result: cancel }); return true
+    }
+    if (permission || (isMcp && p.mode === 'url')) {
+      // Display the URL as text; never navigate or perform an OAuth flow automatically.
+      if (isMcp && (typeof p.url !== 'string' || !/^https?:\/\//i.test(p.url))) {
+        this.write({ id: message.id, result: cancel }); return true
+      }
+      const id = `codex_${randomUUID()}`
+      const result = (choice: string) => isMcp
+        ? { action: choice === 'once' ? 'accept' : 'decline', content: null }
+        : { permissions: choice === 'once' ? p.permissions || {} : {}, scope: 'turn' }
+      const timer = setTimeout(() => {
+        if (this.resolveApproval(id, 'deny').resolved) this.callbacks.approvalResolved(id, 'Codex approval expired')
+      }, CODEX_APPROVAL_TIMEOUT_MS)
+      timer.unref?.()
+      this.approvals.set(id, { rpcId: message.id, timer, choices: ['once', 'deny'], result })
+      this.callbacks.approval({ id, command: '', description: isMcp
+        ? `${p.serverName}: ${p.message || ''}\n${p.url}`
+        : `${p.reason || 'Codex permission request'}\n${JSON.stringify(p.permissions || {})}`,
+        choices: ['once', 'deny'], timeoutMs: CODEX_APPROVAL_TIMEOUT_MS })
+      return true
+    }
+    if (!this.callbacks.clarification) { this.write({ id: message.id, result: cancel }); return true }
+    const id = `codex_input_${randomUUID()}`
+    let question: string
+    let choices: string[] | null = null
+    let respond: (value: string) => object
+    if (isMcp) {
+      question = `${p.serverName}: ${p.message || ''}\nJSON schema: ${JSON.stringify(p.requestedSchema)}`
+      respond = value => ({ action: 'accept', content: parseMcpForm(p.requestedSchema, value) })
+    } else {
+      const questions = p.questions
+      if (!Array.isArray(questions) || !questions.length || questions.some(q => !q || typeof q.id !== 'string' || typeof q.question !== 'string' || q.isSecret)
+        || new Set(questions.map(q => q.id)).size !== questions.length) {
+        this.write({ id: message.id, result: cancel }); return true
+      }
+      const single = questions.length === 1
+      question = questions.map(q => `${q.id}: ${q.question}\n${(q.options || []).map((o: any) => `${o.label}: ${o.description}`).join('\n')}`).join('\n\n')
+      if (!single) question += '\nRespond as JSON: {"questionId":["answer"]}'
+      if (single && !questions[0].isOther && Array.isArray(questions[0].options)) choices = questions[0].options.map((o: any) => String(o.label))
+      respond = value => {
+        const values = single ? { [questions[0].id]: [value] } : JSON.parse(value)
+        const answers: Record<string, { answers: string[] }> = Object.create(null)
+        if (!values || typeof values !== 'object' || Array.isArray(values) || Object.keys(values).length !== questions.length) throw new Error('Invalid answers')
+        for (const q of questions) {
+          const answer = values[q.id]
+          if (!Array.isArray(answer) || answer.length !== 1 || typeof answer[0] !== 'string' || !answer[0].trim()) throw new Error('Missing answer')
+          if (!q.isOther && q.options?.length && !q.options.some((o: any) => o.label === answer[0])) throw new Error('Invalid choice')
+          answers[q.id] = { answers: answer }
+        }
+        return { answers }
+      }
+    }
+    const timer = setTimeout(() => {
+      if (this.resolveClarification(id, '').resolved) this.callbacks.clarificationResolved?.(id, 'Codex input expired')
+    }, CODEX_APPROVAL_TIMEOUT_MS)
+    timer.unref?.()
+    this.interactions.set(id, { rpcId: message.id, timer, respond, cancel })
+    this.callbacks.clarification({ id, question, choices, timeoutMs: CODEX_APPROVAL_TIMEOUT_MS })
+    return true
+  }
+
+  resolveClarification(id: string, value: string): { handled: boolean; resolved: boolean } {
+    const request = this.interactions.get(id)
+    if (!request) return { handled: false, resolved: false }
+    try {
+      if (value.length > 20_000) return { handled: true, resolved: false }
+      this.write({ id: request.rpcId, result: value ? request.respond(value) : request.cancel })
+    } catch { return { handled: true, resolved: false } }
+    clearTimeout(request.timer)
+    this.interactions.delete(id)
+    this.callbacks.activity()
+    return { handled: true, resolved: true }
+  }
+
   private commandSessionKey(method: string, params: any): string | undefined {
     // The CLI process is disposable between turns. Reapply an explicit session
     // grant only for the identical command, directory and native thread/context.
@@ -232,7 +331,7 @@ export class CodexAppServerTurn {
       ? { acceptWithExecpolicyAmendment: { execpolicy_amendment: request.execpolicyAmendment } }
       : choice === 'session' ? 'acceptForSession' : choice === 'once' ? 'accept' : 'decline'
     try {
-      this.write({ id: request.rpcId, result: { decision } })
+      this.write({ id: request.rpcId, result: request.result ? request.result(choice) : { decision } })
     } catch {
       return { handled: true, resolved: false }
     }
@@ -250,6 +349,15 @@ export class CodexAppServerTurn {
     if (!this.threadId || params.threadId !== this.threadId) return
     const turnId = params.turnId || params.turn?.id
     if (!this.turnId || (turnId && turnId !== this.turnId) || this.completed) return
+    if (method === 'serverRequest/resolved') {
+      for (const [id, request] of this.interactions) {
+        if (request.rpcId === params.requestId) { clearTimeout(request.timer); this.interactions.delete(id); this.callbacks.clarificationResolved?.(id, 'Codex request resolved') }
+      }
+      for (const [id, request] of this.approvals) {
+        if (request.rpcId === params.requestId) { clearTimeout(request.timer); this.approvals.delete(id); this.callbacks.approvalResolved(id, 'Codex request resolved') }
+      }
+      return
+    }
     if (method === 'turn/completed') {
       this.clearApprovals('Codex turn completed')
       if (params.turn?.status !== 'completed') {
@@ -265,10 +373,16 @@ export class CodexAppServerTurn {
   }
 
   private clearApprovals(reason: string) {
+    for (const [id, request] of this.interactions) {
+      clearTimeout(request.timer)
+      if (!this.closed) { try { this.write({ id: request.rpcId, result: request.cancel }) } catch {} }
+      this.callbacks.clarificationResolved?.(id, reason)
+    }
+    this.interactions.clear()
     for (const [id, request] of this.approvals) {
       clearTimeout(request.timer)
       if (!this.closed) {
-        try { this.write({ id: request.rpcId, result: { decision: 'decline' } }) } catch {}
+        try { this.write({ id: request.rpcId, result: request.result ? request.result('deny') : { decision: 'decline' } }) } catch {}
       }
       this.callbacks.approvalResolved(id, reason)
     }

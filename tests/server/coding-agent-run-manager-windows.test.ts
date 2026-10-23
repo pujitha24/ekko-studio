@@ -1235,6 +1235,40 @@ describe('coding agent Windows process launch', () => {
     ;(manager as any).sessionIndex.clear()
   })
 
+  it('routes Codex clarification through the owning Studio session only', async () => {
+    const manager = new CodingAgentRunManager()
+    const emitted = vi.fn()
+    ;(manager as any).ensureDbSession = vi.fn()
+    ;(manager as any).addUserMessage = vi.fn()
+    ;(manager as any).emitToChat = emitted
+    manager.start({
+      agentSessionId: 'codex-approval-run', agentId: 'codex', mode: 'scoped',
+      profile: 'default', provider: 'test', model: 'test', sessionId: 'codex-approval-session',
+      command: 'codex.cmd', args: [], shellCommand: 'codex', workspaceDir: process.cwd(),
+      state: { messages: [], isWorking: false, events: [], queue: [] },
+    })
+    manager.send('codex-approval-session', 'hello')
+    await flushCodexHandshake()
+    const child = testState.spawnCalls[0]!.child
+    child.stdout.emit('data', Buffer.from(`${JSON.stringify({
+      id: 'input-rpc', method: 'item/tool/requestUserInput',
+      params: { threadId: 'native-codex-thread', turnId: 'native-codex-turn', itemId: 'input', questions: [{ id: 'q', question: 'Proceed?', options: [{ label: 'Accept', description: 'Continue' }] }] },
+    })}\n`))
+    const prompt = emitted.mock.calls.find(([, event]) => event === 'clarify.requested')![2]
+    expect(prompt).toMatchObject({ source: 'codex', choices: ['Accept'], response_mode: 'select' })
+    expect(manager.resolveClarification('other-session', prompt.clarify_id, 'Accept')).toEqual({ handled: true, resolved: false })
+    expect(manager.resolveClarification('codex-approval-session', prompt.clarify_id, 'Decline')).toEqual({ handled: true, resolved: false })
+    expect(manager.resolveClarification('codex-approval-session', prompt.clarify_id, 'Accept')).toEqual({ handled: true, resolved: true })
+    expect(child.stdin.write.mock.calls.map(([data]: [string]) => JSON.parse(data)))
+      .toContainEqual({ jsonrpc: '2.0', id: 'input-rpc', result: { answers: { q: { answers: ['Accept'] } } } })
+    expect(manager.resolveClarification('codex-approval-session', prompt.clarify_id, 'Accept')).toEqual({ handled: true, resolved: false })
+    const run = (manager as any).runs.get('codex-approval-run')
+    run.codexAppServerTurn.dispose()
+    clearTimeout(run.idleTimer)
+    ;(manager as any).runs.clear()
+    ;(manager as any).sessionIndex.clear()
+  })
+
   it('keeps long global Codex prompts in the Studio-owned prompt file', () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'hermes-global-codex-prompt-'))
     const promptPath = join(tempDir, 'AGENTS.md')
